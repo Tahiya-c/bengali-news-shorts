@@ -1,0 +1,38 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.Python
+venv/
+env/
+.venv
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+.env.local
+
+# Project files that don't need to be in Docker
+*.zip
+*.mp4
+ffmpeg.zip
+ffmpeg-master-latest-win64-gpl.zip
+debug_output.txt
+.env
+
+# Large files
+input/
+temp/
+output/
+transcripts/
+logs/

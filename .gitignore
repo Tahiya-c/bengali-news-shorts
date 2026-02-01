@@ -1,0 +1,53 @@
+# Environment variables (API keys!)
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project - Large Files
+input/*.mp4
+input/*.mov
+input/*.avi
+uploads/
+ffmpeg.zip
+ffmpeg-master-latest-win64-gpl.zip
+
+# Project - Generated Files (auto-created)
+temp/
+output/
+outputs/
+logs/
+*.log
+
+# Whisper cache (will be re-downloaded in Docker)
+.cache/
+
+# Large binaries (Docker will install FFmpeg)
+ffmpeg-master-latest-win64-gpl/
+
+# Debug files
+debug_output.txt
+.pytest_cache/
