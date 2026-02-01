@@ -35,9 +35,9 @@ if ENV_FILE.exists():
             key, value = line.split('=', 1)
             os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
-# Set API key directly if not in .env
+# Set API key from environment (will be set by Railway or .env file)
 if "GEMINI_API_KEY" not in os.environ:
-    os.environ["GEMINI_API_KEY"] = "AIzaSyAr47FEJa_Y6T5Pwf-VfTT_o06mrrxT50M"
+    raise ValueError("GEMINI_API_KEY not found! Set it in .env or Railway Variables")
 
 # Force UTF-8 encoding for all operations
 try:
