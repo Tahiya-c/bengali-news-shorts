@@ -242,9 +242,7 @@ def test_pipeline():
             'error': str(e)
         })
 
-# ============================================================================
-# API ENDPOINTS (KEEP YOUR EXISTING HTML - IT'S FINE)
-# ============================================================================
+# API ENDPOINTS 
 
 @app.route('/', methods=['GET'])
 def dashboard():
