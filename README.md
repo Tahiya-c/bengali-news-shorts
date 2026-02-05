@@ -138,7 +138,6 @@ flask-cors>=4.0.0
 werkzeug>=2.3.0
 requests>=2.31.0
 ```
-
 ---
 
 ## 🚀 Deployment
@@ -158,7 +157,7 @@ python app.py  # http://localhost:5000
 ## 📝 Web API
 
 ```
-POST /api/upload           # Upload video
+POST /api/upload           # Upload video(s)
 GET /api/job/{job_id}      # Check status
 GET /api/download/{file}   # Download result
 GET /api/jobs              # List all jobs
