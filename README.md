@@ -163,6 +163,14 @@ GET /api/download/{file}   # Download result
 GET /api/jobs              # List all jobs
 DELETE /api/job/{job_id}   # Cancel job
 ```
+---
+## 📊 UI Demo & Sample Outputs
+
+- **[View UI Demo](UI_demo/ModelDemo_UI.pdf)** - Web interface walkthrough
+- **[Sample Output Videos](https://drive.google.com/drive/folders/1rl8WCg64T1sL45UTp-StPXgI4pydDsTi?usp=sharing)** - Production examples
+
+*Note: Each video was created during production with different time intervals and format scaling as per client requirements.*
+
 
 ---
 
