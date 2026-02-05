@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
 FINAL PRODUCTION BENGALI YOUTUBE SHORTS PIPELINE
-- FASTER-WHISPER: 3x faster transcription (20-40s instead of 60-120s)
-- Same accuracy as Whisper Small (85% for Bengali)
+- FASTER-WHISPER: 3x faster transcription
+- SINGLE CONTINUOUS SECTION: Better quality than stitching
+- GEMINI ENHANCED: Smart 45-55s section selection
 - Optimized for web hosting (Railway/Render/AWS)
-- Session caching (no model reinstalls)
-- Seamless video stitching (no overlaps)
-- No transcript output
 """
 
 import os
@@ -20,7 +18,7 @@ import locale
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Optional
 import io
 
 # ============================================================================
@@ -35,7 +33,7 @@ if ENV_FILE.exists():
             os.environ[key.strip()] = value.strip().strip('"').strip("'")
 
 if "GEMINI_API_KEY" not in os.environ:
-    raise ValueError("GEMINI_API_KEY not found! Set it in .env or Railway Variables")
+    print("⚠️ GEMINI_API_KEY not found! Will use simple selection method")
 
 try:
     locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
@@ -65,16 +63,22 @@ FOLDERS = {
 }
 
 TARGET_DURATION_MIN = 45
-TARGET_DURATION_MAX = 60
+TARGET_DURATION_MAX = 55  # Shorter for better YouTube Shorts retention
 ENCODE_PRESET = "veryfast"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 print("\n" + "=" * 80)
-print("BENGALI YOUTUBE SHORTS PIPELINE - FASTER-WHISPER (3X SPEED)")
+print("BENGALI YOUTUBE SHORTS PIPELINE - SINGLE SECTION MODE")
 print("=" * 80)
 print(f"\n🔧 CONFIGURATION:")
+print(f"   Target: {TARGET_DURATION_MIN}-{TARGET_DURATION_MAX}s single continuous section")
 print(f"   Input folder: {FOLDERS['input']}")
 print(f"   Output folder: {FOLDERS['output']}")
-print(f"   Temp folder: {FOLDERS['temp']}\n")
+print(f"   Temp folder: {FOLDERS['temp']}")
+if GEMINI_API_KEY:
+    print(f"   ✅ Gemini API: Available")
+else:
+    print(f"   ⚠️ Gemini API: Not available (using simple selection)\n")
 
 # ============================================================================
 # GLOBAL SESSION STATE
@@ -94,7 +98,6 @@ class Segment:
     start: float
     end: float
     text: str
-    importance: float = 0.0
     
     @property
     def duration(self) -> float:
@@ -110,90 +113,46 @@ def safe_write_file(filepath, content):
         f.write(content)
 
 # ============================================================================
-# FASTER-WHISPER MODEL LOADER (3x Faster)
+# FASTER-WHISPER MODEL LOADER
 # ============================================================================
 
 def get_faster_whisper_model():
-    """
-    Load Faster-Whisper once per session.
-    CRITICAL: 3x faster than OpenAI Whisper, same accuracy for Bengali.
-    Uses CTranslate2 optimized inference engine.
-    """
+    """Load Faster-Whisper once per session"""
     global _SESSION_STATE
     
     if _SESSION_STATE["faster_whisper_model"] is not None:
-        print("[1.2/6] Using cached Faster-Whisper from session\n")
         return _SESSION_STATE["faster_whisper_model"]
     
-    print("[1.2/6] Loading Faster-Whisper (3x faster transcription)...")
+    print("[1.2/6] Loading Faster-Whisper...")
     
     try:
         from faster_whisper import WhisperModel
         
-        # Load small model with int8 quantization for speed
+        # Determine device
+        device = "cuda" if sys.platform != "win32" and not os.environ.get("RAILWAY_ENVIRONMENT") else "cpu"
+        compute_type = "float16" if device == "cuda" else "int8"
+        
         model = WhisperModel(
             "small",
-            device="cpu",
-            compute_type="int8",  # Quantized for speed
+            device=device,
+            compute_type=compute_type,
             num_workers=2,
-            download_root="/tmp/whisper_cache"  # Cache downloads for web hosting
+            download_root="/tmp/whisper_cache"
         )
         
         _SESSION_STATE["faster_whisper_model"] = model
         _SESSION_STATE["model_loaded"] = True
         
-        print("      ✅ Faster-Whisper ready (20-40s per video)\n")
+        print("      ✅ Faster-Whisper ready\n")
         return model
         
     except ImportError:
         print("      ❌ faster-whisper not installed!")
-        print("      Run: pip uninstall openai-whisper -y && pip install faster-whisper ctranslate2\n")
+        print("      Run: pip install faster-whisper\n")
         raise
     except Exception as e:
         print(f"      ❌ Failed to load Faster-Whisper: {e}\n")
         raise
-
-# ============================================================================
-# AUDIO PREPROCESSING
-# ============================================================================
-
-def preprocess_audio_to_16khz_mono(video_path: Path, output_wav: Path) -> bool:
-    """Convert video audio to 16kHz mono WAV"""
-    ffmpeg_cmd = "ffmpeg"
-    
-    cmd = [
-        ffmpeg_cmd, '-y', '-loglevel', 'error',
-        '-i', str(video_path),
-        '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-        str(output_wav)
-    ]
-    
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        return result.returncode == 0
-    except:
-        return False
-
-# ============================================================================
-# AUDIO CODEC DETECTION
-# ============================================================================
-
-def detect_audio_codec(video_path: Path) -> str:
-    """Detect audio codec to skip re-encoding if possible"""
-    try:
-        ffprobe_cmd = "ffprobe"
-        cmd = [
-            ffprobe_cmd, '-v', 'error',
-            '-select_streams', 'a:0',
-            '-show_entries', 'stream=codec_name',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            str(video_path)
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        codec = result.stdout.strip().lower()
-        return codec
-    except:
-        return "unknown"
 
 # ============================================================================
 # FFMPEG UTILITIES
@@ -216,71 +175,37 @@ def get_duration(video_path: Path) -> float:
     except:
         return 0
 
-def cut_clip(video_path: Path, start: float, end: float, output_path: Path, video_duration: float) -> bool:
-    """Cut clip with smart audio codec detection"""
+def cut_clip(video_path: Path, start: float, end: float, output_path: Path) -> bool:
+    """Cut a single continuous section"""
     duration = end - start
     if duration > 120 or duration < 1:
         return False
     
-    # Detect audio codec
-    audio_codec = detect_audio_codec(video_path)
-    can_copy_audio = audio_codec in ['aac', 'mp3', 'libmp3lame']
-    
     ffmpeg_cmd = "ffmpeg"
-    
-    # Build audio args based on codec
-    if can_copy_audio:
-        audio_args = ['-c:a', 'copy']  # Fast: no re-encoding
-    else:
-        audio_args = ['-c:a', 'aac', '-b:a', '128k']
     
     cmd = [
         ffmpeg_cmd, '-y', '-loglevel', 'error',
-        '-ss', str(max(0, start - 0.5)), '-i', str(video_path),
-        '-t', str(duration + 1), '-c:v', 'libx264', '-preset', ENCODE_PRESET,
-        '-crf', '28'
-    ] + audio_args + [str(output_path)]
+        '-ss', str(start), '-i', str(video_path),
+        '-t', str(duration),
+        '-c:v', 'libx264', '-preset', ENCODE_PRESET, '-crf', '23',
+        '-c:a', 'aac', '-b:a', '192k',
+        '-avoid_negative_ts', 'make_zero',
+        str(output_path)
+    ]
     
-    success, _ = run_ffmpeg(cmd, timeout=120)
+    success, error = run_ffmpeg(cmd, timeout=120)
+    if not success:
+        print(f"      FFmpeg error: {error[:100]}")
     return success
-
-def stitch_clips(clip_paths: List[Path], output_path: Path) -> bool:
-    """Stitch clips seamlessly with NO overlaps"""
-    if len(clip_paths) == 1:
-        try:
-            shutil.copy2(clip_paths[0], output_path)
-            return True
-        except:
-            return False
-    
-    concat_file = FOLDERS["temp"] / f"concat_{os.getpid()}.txt"
-    try:
-        with open(concat_file, 'w', encoding='utf-8') as f:
-            for clip in clip_paths:
-                f.write(f"file '{clip.resolve()}'\n")
-        
-        ffmpeg_cmd = "ffmpeg"
-        cmd = [
-            ffmpeg_cmd, '-y', '-loglevel', 'error', 
-            '-f', 'concat', '-safe', '0', 
-            '-i', str(concat_file), 
-            '-c', 'copy',  # Seamless join, no overlaps
-            str(output_path)
-        ]
-        success, _ = run_ffmpeg(cmd, timeout=120)
-        concat_file.unlink(missing_ok=True)
-        return success
-    except:
-        return False
 
 def make_vertical(input_path: Path, output_path: Path) -> bool:
     """Convert to 9:16 vertical format"""
     ffmpeg_cmd = "ffmpeg"
     cmd = [
         ffmpeg_cmd, '-y', '-loglevel', 'error', '-i', str(input_path),
-        '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease:flags=bilinear,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
-        '-c:v', 'libx264', '-preset', ENCODE_PRESET, '-crf', '26',
-        '-c:a', 'aac', '-b:a', '128k',
+        '-vf', 'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black',
+        '-c:v', 'libx264', '-preset', ENCODE_PRESET, '-crf', '23',
+        '-c:a', 'aac', '-b:a', '192k',
         '-movflags', '+faststart',
         str(output_path)
     ]
@@ -288,225 +213,246 @@ def make_vertical(input_path: Path, output_path: Path) -> bool:
     return success
 
 # ============================================================================
-# TRANSCRIPTION WITH FASTER-WHISPER (3x SPEED)
+# TRANSCRIPTION WITH FASTER-WHISPER
 # ============================================================================
 
 def transcribe_fast(video_path: Path) -> List[Segment]:
     """
-    FAST TRANSCRIPTION using Faster-Whisper.
-    
-    Performance:
-    - 20-40 seconds for 2-10 minute video (3x faster than Whisper)
-    - Same accuracy as Whisper Small (85% for Bengali)
-    - Uses CTranslate2 optimized inference
+    Transcribe using Faster-Whisper with VAD filtering
     """
-    print("[1.5/6] Preprocessing audio...")
-    
-    audio_path = FOLDERS["temp"] / f"audio_{os.getpid()}.wav"
-    
-    if preprocess_audio_to_16khz_mono(video_path, audio_path):
-        print("      ✅ Audio extracted\n")
-        transcribe_source = audio_path
-    else:
-        print("      ⚠️ Audio extraction skipped\n")
-        transcribe_source = video_path
-    
-    print("[2/6] Transcribing with Faster-Whisper (3x faster)...")
+    print("[2/6] Transcribing with Faster-Whisper...")
     
     try:
         model = get_faster_whisper_model()
         
-        # Transcribe with optimized parameters for speed
+        # Transcribe with VAD filtering for better segment detection
         segments_info, info = model.transcribe(
-            str(transcribe_source),
-            language="bn",  # Bengali
-            beam_size=5,     # Fast decoding (default is 5)
-            vad_filter=True, # Skip silence sections (30% faster)
+            str(video_path),
+            language="bn",
+            beam_size=5,
+            vad_filter=True,
             vad_parameters=dict(
-                min_silence_duration_ms=500,
-                speech_pad_ms=200
+                min_silence_duration_ms=1000,
+                speech_pad_ms=500,
+                threshold=0.5
             )
         )
         
         segments = []
         for seg in segments_info:
             text = seg.text.strip()
-            if len(text) >= 3:
+            if len(text) >= 3 and seg.end - seg.start >= 2:  # Minimum 2 seconds
                 segments.append(Segment(
-                    start=seg.start,
-                    end=seg.end,
+                    start=max(0, seg.start - 0.3),  # Start a bit earlier
+                    end=seg.end + 0.3,              # End a bit later
                     text=text
                 ))
         
-        print(f"      ✅ {len(segments)} segments found (20-40s total)\n")
+        print(f"      ✅ Found {len(segments)} speech segments\n")
+        return segments
         
     except Exception as e:
         print(f"      ❌ Transcription error: {e}\n")
-        segments = []
-    
-    # Cleanup
-    if audio_path.exists():
-        try:
-            audio_path.unlink()
-        except:
-            pass
-    
-    return segments
+        return []
 
 # ============================================================================
-# GEMINI ANALYSIS
+# SIMPLE SEGMENT SELECTION - FIND BEST SINGLE CONTINUOUS SECTION
 # ============================================================================
 
-def analyze_with_gemini(segments: List[Segment], video_name: str) -> Tuple[bool, List[int]]:
-    """Use Gemini to select segments targeting 45-60s YouTube Short"""
-    api_key = os.getenv("GEMINI_API_KEY")
-    
-    if not api_key:
-        print("[3/6] Gemini analysis: ⚠️ No API key - using smart selection\n")
-        return False, []
-    
+def find_best_single_section(segments: List[Segment], video_duration: float) -> Tuple[float, float]:
+    """
+    Find the best single continuous section of 45-55 seconds.
+    Returns (start_time, end_time)
+    """
     if not segments:
-        return False, []
+        return (0, 0)
     
-    print("[3/6] Gemini analyzing segments...")
+    print("[3/6] Finding best single continuous section...")
+    
+    # Sort by start time
+    segments = sorted(segments, key=lambda x: x.start)
+    
+    best_start = 0
+    best_end = 0
+    best_score = -1
+    
+    # Look for good sections in the video
+    for i in range(len(segments)):
+        current_start = segments[i].start
+        current_end = current_start
+        
+        # Try to build a section starting from this segment
+        for j in range(i, len(segments)):
+            segment_end = segments[j].end
+            
+            # Check if adding this segment keeps us under max duration
+            if segment_end - current_start <= TARGET_DURATION_MAX:
+                current_end = segment_end
+                
+                # Calculate score for this section
+                section_duration = current_end - current_start
+                
+                if TARGET_DURATION_MIN <= section_duration <= TARGET_DURATION_MAX:
+                    # Good duration range - score it
+                    score = section_duration
+                    
+                    # Bonus for being in middle of video (not beginning/end)
+                    mid_point = (current_start + current_end) / 2
+                    if video_duration * 0.2 <= mid_point <= video_duration * 0.8:
+                        score += 10
+                    
+                    # Bonus for including more segments (coherence)
+                    num_segments_included = j - i + 1
+                    score += num_segments_included * 5
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_start = current_start
+                        best_end = current_end
+    
+    # If no perfect section found, find the best available
+    if best_score == -1:
+        # Try to find the longest coherent section
+        for i in range(len(segments)):
+            for j in range(i, len(segments)):
+                section_start = segments[i].start
+                section_end = segments[j].end
+                section_duration = section_end - section_start
+                
+                if section_duration >= 30:  # At least 30 seconds
+                    if section_duration > best_score:
+                        best_score = section_duration
+                        best_start = section_start
+                        best_end = section_end
+    
+    # Ensure we don't exceed video duration
+    best_end = min(best_end, video_duration)
+    best_start = max(0, best_start)
+    
+    duration = best_end - best_start
+    
+    if duration >= TARGET_DURATION_MIN:
+        print(f"      ✅ Found {duration:.0f}s section: {best_start:.0f}s-{best_end:.0f}s\n")
+        return (best_start, best_end)
+    else:
+        print(f"      ⚠️ Best section only {duration:.0f}s (target: {TARGET_DURATION_MIN}s)\n")
+        # Try to extend the section
+        extension_needed = TARGET_DURATION_MIN - duration
+        if extension_needed > 0:
+            # Extend end time
+            best_end = min(best_end + extension_needed, video_duration)
+            duration = best_end - best_start
+            
+            if duration >= TARGET_DURATION_MIN:
+                print(f"      ✅ Extended to {duration:.0f}s\n")
+                return (best_start, best_end)
+    
+    return (0, 0)
+
+# ============================================================================
+# GEMINI ENHANCED SELECTION
+# ============================================================================
+
+def analyze_with_gemini(segments: List[Segment], video_name: str, video_duration: float) -> Tuple[bool, float, float]:
+    """Use Gemini to find the best single continuous section"""
+    if not GEMINI_API_KEY or not segments:
+        return False, 0, 0
+    
+    print("[3/6] Using Gemini to find coherent section...")
     
     try:
-        segment_text = "\n".join([
-            f"[{i+1}] ({s.start:.1f}s-{s.end:.1f}s, {s.duration:.0f}s) {s.text[:80]}"
-            for i, s in enumerate(segments[:40])
-        ])
+        # Group segments into chunks for analysis
+        chunk_size = 15  # seconds
+        chunks = []
+        current_chunk = []
+        current_chunk_end = 0
         
-        prompt = f"""You are a YouTube Shorts expert. Analyze this Bengali news video and select segments for a YouTube Short.
+        for seg in segments:
+            if not current_chunk or seg.start - current_chunk_end <= 5:
+                current_chunk.append(seg)
+                current_chunk_end = seg.end
+            else:
+                if current_chunk:
+                    chunk_text = " ".join([s.text for s in current_chunk])
+                    chunk_start = current_chunk[0].start
+                    chunk_end = current_chunk[-1].end
+                    chunks.append((chunk_start, chunk_end, chunk_text))
+                current_chunk = [seg]
+                current_chunk_end = seg.end
+        
+        if current_chunk:
+            chunk_text = " ".join([s.text for s in current_chunk])
+            chunk_start = current_chunk[0].start
+            chunk_end = current_chunk[-1].end
+            chunks.append((chunk_start, chunk_end, chunk_text))
+        
+        # Prepare prompt for Gemini
+        chunk_descriptions = []
+        for i, (start, end, text) in enumerate(chunks[:15]):  # Limit to first 15 chunks
+            duration = end - start
+            if duration >= 10:  # Only show chunks of at least 10 seconds
+                chunk_descriptions.append(f"[{i}] {start:.0f}s-{end:.0f}s ({duration:.0f}s): {text[:100]}...")
+        
+        prompt = f"""Select the SINGLE best 45-55 second section from this Bengali news video for a YouTube Short.
 
 VIDEO: {video_name}
-TOTAL_SEGMENTS: {len(segments)}
+TOTAL DURATION: {video_duration:.0f} seconds
 
-SEGMENTS WITH TIMING:
-{segment_text}
+AVAILABLE SECTIONS:
+{chr(10).join(chunk_descriptions)}
 
-INSTRUCTIONS:
-1. Select segments that discuss the SAME news topic (coherent narrative)
-2. Total duration MUST be 45-60 seconds (YouTube Shorts standard)
-3. Prefer segments with clear content (skip filler/ads)
-4. If video is shorter than 45s, use ALL meaningful segments
-5. Prioritize segments from different time points for variety
-6. Never select overlapping segments
+CRITERIA:
+1. Choose ONE continuous section (don't combine multiple sections)
+2. Duration MUST be 45-55 seconds
+3. Should be coherent (complete thought/paragraph)
+4. Avoid beginnings/ends with filler content
+5. Prefer sections with clear news content
+6. Section must be within the video duration
 
-Return ONLY this JSON (no markdown):
-{{"selected_indices": [0, 2, 4], "total_duration": 52, "topic": "Topic name", "reason": "Why these segments"}}"""
+Return ONLY the JSON:
+{{"start_seconds": 120, "end_seconds": 175, "reason": "This section discusses..."}}"""
         
         response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
             headers={"Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
-                    "temperature": 0.3,
-                    "maxOutputTokens": 500
+                    "temperature": 0.2,
+                    "maxOutputTokens": 200
                 }
             },
             timeout=30
         )
         
         if response.status_code == 200:
-            try:
-                data = response.json()
-                text = data['candidates'][0]['content']['parts'][0]['text'].strip()
-                text = re.sub(r'```json|```', '', text).strip()
-                result = json.loads(text)
-                indices = result.get("selected_indices", [])
-                topic = result.get("topic", "Bengali News")
-                
-                if indices:
-                    total = sum(segments[i].duration for i in indices if i < len(segments))
-                    print(f"      ✅ Gemini selected {len(indices)} segments")
-                    print(f"         Topic: {topic}")
-                    print(f"         Duration: {total:.0f}s\n")
-                    return True, indices
-            except (json.JSONDecodeError, KeyError, IndexError):
-                print(f"      ⚠️ Gemini parse error - using smart fallback\n")
-                return False, []
-        else:
-            print(f"      ⚠️ Gemini API error - using smart fallback\n")
-            return False, []
+            data = response.json()
+            text = data['candidates'][0]['content']['parts'][0]['text'].strip()
+            text = re.sub(r'```json|```', '', text).strip()
+            result = json.loads(text)
+            
+            start_time = result.get("start_seconds", 0)
+            end_time = result.get("end_seconds", 0)
+            reason = result.get("reason", "")
+            
+            duration = end_time - start_time
+            
+            # Validate Gemini's selection
+            if (TARGET_DURATION_MIN <= duration <= TARGET_DURATION_MAX and 
+                start_time >= 0 and end_time <= video_duration):
+                print(f"      ✅ Gemini selected: {start_time:.0f}s-{end_time:.0f}s ({duration:.0f}s)")
+                print(f"      Reason: {reason[:80]}...\n")
+                return True, start_time, end_time
         
-    except requests.Timeout:
-        print(f"      ⚠️ Gemini timeout - using smart fallback\n")
-        return False, []
+        print("      ⚠️ Gemini didn't find suitable section, using simple method\n")
+        return False, 0, 0
+        
     except Exception as e:
-        print(f"      ⚠️ Gemini error - using smart fallback\n")
-        return False, []
+        print(f"      ❌ Gemini error: {str(e)[:100]}\n")
+        return False, 0, 0
 
 # ============================================================================
-# SMART SEGMENT SELECTION
-# ============================================================================
-
-def smart_select_segments(segments: List[Segment]) -> List[int]:
-    """Select segments to reach 45-60 seconds"""
-    if not segments:
-        return []
-    
-    scored = []
-    for i, seg in enumerate(segments):
-        score = 0
-        text_lower = seg.text.lower()
-        
-        if any(skip in text_lower for skip in ['subscribe', 'channel', 'like', 'bell', 'click']):
-            score = -999
-        else:
-            if seg.duration >= 5:
-                score += 3.0
-            elif seg.duration >= 3:
-                score += 2.0
-            elif seg.duration >= 2:
-                score += 1.0
-            
-            word_count = len(seg.text.split())
-            if word_count >= 10:
-                score += 2.0
-            elif word_count >= 5:
-                score += 1.0
-            
-            if seg.duration < 1.5:
-                score -= 1.0
-        
-        scored.append((score, i, seg))
-    
-    scored.sort(reverse=True, key=lambda x: x[0])
-    
-    selected_indices = []
-    total_duration = 0
-    
-    good_segments = [(idx, seg) for score, idx, seg in scored if score >= 1.0]
-    
-    if len(good_segments) >= 3:
-        good_segments.sort(key=lambda x: x[0])
-        
-        for idx, seg in good_segments:
-            selected_indices.append(idx)
-            total_duration += seg.duration
-            
-            if total_duration >= TARGET_DURATION_MIN:
-                break
-    else:
-        selected_indices = [idx for idx, seg in good_segments]
-        total_duration = sum(seg.duration for idx, seg in good_segments)
-    
-    if total_duration < TARGET_DURATION_MIN:
-        for score, idx, seg in scored:
-            if idx not in selected_indices and score >= 0:
-                selected_indices.append(idx)
-                total_duration += seg.duration
-                if total_duration >= TARGET_DURATION_MIN:
-                    break
-    
-    selected_indices.sort()
-    total_duration = sum(segments[i].duration for i in selected_indices if i < len(segments))
-    print(f"      💡 Smart selection: {len(selected_indices)} segments, {total_duration:.0f}s\n")
-    return selected_indices
-
-# ============================================================================
-# MAIN PIPELINE
+# MAIN PROCESSING PIPELINE
 # ============================================================================
 
 def process_video(video_path: Path) -> Optional[Path]:
@@ -516,111 +462,135 @@ def process_video(video_path: Path) -> Optional[Path]:
     
     start_time = datetime.now()
     
-    # Get duration
+    # Step 1: Get video duration
     duration = get_duration(video_path)
-    if duration < 30:
-        print("❌ Video too short (< 30s)\n")
+    if duration < 60:
+        print("❌ Video too short (< 60s)\n")
         return None
     
-    print(f"[0/6] Video duration: {duration/60:.1f} minutes\n")
+    print(f"[1/6] Video duration: {duration/60:.1f} minutes\n")
     
-    # Transcribe with Faster-Whisper (3x faster)
+    # Step 2: Transcribe
     segments = transcribe_fast(video_path)
     if not segments:
-        print("❌ No segments transcribed\n")
+        print("❌ No speech segments found\n")
         return None
     
-    # Try Gemini first, fall back to smart selection
-    success, indices = analyze_with_gemini(segments, video_path.stem)
+    # Step 3: Try Gemini first, then fallback to simple method
+    gemini_success, section_start, section_end = analyze_with_gemini(segments, video_path.stem, duration)
     
-    if not indices:
-        print("[3/6] Using smart selection (45-60s target)...")
-        indices = smart_select_segments(segments)
+    if not gemini_success:
+        # Use simple method
+        section_start, section_end = find_best_single_section(segments, duration)
     
-    # Get selected segments in chronological order
-    selected = [segments[i] for i in indices if i < len(segments)]
-    selected = sorted(selected, key=lambda x: x.start)
-    
-    if not selected:
-        print("❌ No segments selected\n")
+    # Validate section
+    if section_end - section_start < 30:
+        print("❌ No suitable section found (minimum 30s)\n")
         return None
     
-    total_duration = sum(s.duration for s in selected)
+    # Ensure section is within bounds
+    section_start = max(0, section_start)
+    section_end = min(duration, section_end)
+    section_duration = section_end - section_start
     
-    # Add more segments if needed
-    if total_duration < TARGET_DURATION_MIN:
-        print(f"⚠️ Duration {total_duration:.0f}s < {TARGET_DURATION_MIN}s minimum")
-        print(f"   Adding more segments...\n")
-        
-        remaining = [s for s in segments if s not in selected]
-        for seg in remaining:
-            selected.append(seg)
-            total_duration += seg.duration
-            if total_duration >= TARGET_DURATION_MIN:
-                break
-        
-        selected = sorted(selected, key=lambda x: x.start)
+    print(f"[4/6] Selected section: {section_start:.0f}s - {section_end:.0f}s ({section_duration:.0f}s)\n")
     
-    print(f"[4/6] Cutting {len(selected)} clips (total: {total_duration:.0f}s)...")
+    # Step 4: Cut the single section
+    print("[5/6] Cutting section...")
     
-    # Cut clips
-    clip_paths = []
-    for i, seg in enumerate(selected):
-        clip_path = FOLDERS["temp"] / f"clip_{i}.mp4"
-        if cut_clip(video_path, seg.start, seg.end, clip_path, duration):
-            clip_paths.append(clip_path)
-        else:
-            print(f"      ⚠️ Failed to cut clip {i+1}")
+    # Create temp output
+    temp_output = FOLDERS["temp"] / f"cut_{os.getpid()}.mp4"
     
-    if not clip_paths:
-        print("❌ No clips created\n")
+    success = cut_clip(video_path, section_start, section_end, temp_output)
+    
+    if not success or not temp_output.exists():
+        print("❌ Failed to cut section\n")
         return None
     
-    print(f"      ✅ {len(clip_paths)} clips ready\n")
+    print(f"      ✅ Cut successful\n")
     
-    # Stitch
-    if len(clip_paths) > 1:
-        print("[5/6] Stitching clips seamlessly...")
-        stitched = FOLDERS["temp"] / f"stitched_{os.getpid()}.mp4"
-        if not stitch_clips(clip_paths, stitched):
-            print("      ❌ Stitching failed\n")
-            return None
-        working_path = stitched
-        print("      ✅ Stitched (seamless, no overlaps)\n")
-    else:
-        working_path = clip_paths[0]
-        print("[5/6] Single clip - no stitching needed\n")
-    
-    # Vertical conversion
+    # Step 5: Convert to vertical
     print("[6/6] Converting to vertical (9:16)...")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = FOLDERS["output"] / f"{video_path.stem}_{timestamp}_SHORT.mp4"
     
-    if not make_vertical(working_path, output_path):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    final_output = FOLDERS["output"] / f"{video_path.stem}_{timestamp}_SHORT.mp4"
+    
+    # First check if temp file has audio
+    check_audio_cmd = ["ffprobe", "-i", str(temp_output), "-show_streams", "-select_streams", "a", "-loglevel", "error"]
+    has_audio = subprocess.run(check_audio_cmd, capture_output=True).returncode == 0
+    
+    if not has_audio:
+        print("      ⚠️ No audio detected in cut section, using original audio...")
+        # Extract audio from original video for the same section
+        audio_temp = FOLDERS["temp"] / f"audio_{os.getpid()}.aac"
+        audio_cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-ss", str(section_start), "-i", str(video_path),
+            "-t", str(section_duration),
+            "-vn", "-c:a", "aac", "-b:a", "192k",
+            str(audio_temp)
+        ]
+        subprocess.run(audio_cmd, capture_output=True)
+        
+        # Merge video with extracted audio
+        merge_cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", str(temp_output),
+            "-i", str(audio_temp),
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            str(FOLDERS["temp"] / f"with_audio_{os.getpid()}.mp4")
+        ]
+        subprocess.run(merge_cmd, capture_output=True)
+        temp_output = FOLDERS["temp"] / f"with_audio_{os.getpid()}.mp4"
+    
+    # Now convert to vertical
+    if not make_vertical(temp_output, final_output):
         print("      ❌ Vertical conversion failed\n")
         return None
     
-    if not output_path.exists():
+    if not final_output.exists():
         print("      ❌ Output file not created\n")
         return None
     
-    size_mb = output_path.stat().st_size / (1024*1024)
+    # Verify final output
+    final_duration = get_duration(final_output)
+    size_mb = final_output.stat().st_size / (1024*1024)
     elapsed = (datetime.now() - start_time).total_seconds()
     
-    print(f"      ✅ {size_mb:.1f} MB\n")
+    print(f"      ✅ {size_mb:.1f} MB, {final_duration:.1f}s duration\n")
     
-    # Cleanup temp files
+    # Cleanup
     for f in FOLDERS["temp"].glob("*"):
         try:
             f.unlink(missing_ok=True)
         except:
             pass
     
-    print(f"✅ SUCCESS in {elapsed:.0f}s")
-    print(f"   Output: {output_path.name}")
-    print(f"   Duration: {total_duration:.0f}s\n")
+    # Create transcript
+    try:
+        transcript_path = final_output.with_suffix('.txt')
+        with open(transcript_path, 'w', encoding='utf-8') as f:
+            f.write(f"Video: {video_path.name}\n")
+            f.write(f"Section: {section_start:.1f}s - {section_end:.1f}s ({section_duration:.1f}s)\n")
+            f.write(f"Created: {datetime.now()}\n\n")
+            
+            # Find segments in this section
+            for seg in segments:
+                if section_start <= seg.start <= section_end:
+                    f.write(f"[{seg.start:.1f}s-{seg.end:.1f}s] {seg.text}\n")
+        
+        print(f"📝 Transcript saved\n")
+    except:
+        pass
     
-    return output_path
+    print(f"✅ SUCCESS in {elapsed:.0f}s")
+    print(f"   Output: {final_output.name}")
+    print(f"   Duration: {final_duration:.1f}s\n")
+    
+    return final_output
 
 # ============================================================================
 # MAIN
@@ -638,48 +608,58 @@ def main():
     
     print()
     
-    api_key = os.getenv("GEMINI_API_KEY")
-    if api_key:
+    if GEMINI_API_KEY:
         print(f"✅ Gemini API key loaded\n")
     else:
-        print(f"⚠️ No Gemini API key (will use smart selection)\n")
+        print(f"⚠️ Using simple selection method only\n")
     
     # Get videos
-    video_files = {}
     input_folder = FOLDERS["input"]
-    
     if not input_folder.exists():
         print(f"❌ Input folder not found: {input_folder}")
         return
     
-    for vid in list(input_folder.glob("*.mp4")) + list(input_folder.glob("*.MP4")):
-        key = (vid.name, vid.stat().st_size)
-        if key not in video_files:
-            video_files[key] = vid
+    # Find all video files
+    videos = []
+    for ext in ['.mp4', '.MP4', '.mov', '.MOV', '.mkv', '.avi']:
+        videos.extend(list(input_folder.glob(f"*{ext}")))
     
-    videos = list(video_files.values())
+    # Remove duplicates by name
+    unique_videos = {}
+    for video in videos:
+        key = (video.name.lower(), video.stat().st_size)
+        if key not in unique_videos:
+            unique_videos[key] = video
+    
+    videos = list(unique_videos.values())
     
     if not videos:
-        print(f"❌ No videos in {input_folder}\n")
+        print(f"❌ No videos found in {input_folder}")
         return
     
-    print(f"Found {len(videos)} unique video(s)\n")
+    print(f"Found {len(videos)} video(s)\n")
     
-    # Process all videos (session state prevents model reloading)
+    # Process all videos
     results = []
     for video in videos:
         try:
             output = process_video(video)
             if output:
                 results.append(output)
+                
+                # Check if output is good
+                duration = get_duration(output)
+                if duration < TARGET_DURATION_MIN:
+                    print(f"⚠️ Warning: Output only {duration:.0f}s (less than target {TARGET_DURATION_MIN}s)")
         except Exception as e:
             print(f"❌ Error processing {video.name}: {e}\n")
     
-    print("=" * 80)
+    print("\n" + "=" * 80)
     if results:
         print(f"✅ DONE! Created {len(results)} short(s)")
         for r in results:
-            print(f"   📺 {r.name}")
+            duration = get_duration(r)
+            print(f"   📺 {r.name} ({duration:.0f}s)")
         print(f"\n📁 Output folder: {FOLDERS['output']}\n")
     else:
         print("❌ No shorts created\n")
